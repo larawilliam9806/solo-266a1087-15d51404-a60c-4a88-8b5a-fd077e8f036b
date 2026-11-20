@@ -45,6 +45,85 @@ python3 -m venv .venv
 - 每次匹配显式指定 `network_version`,分析全程只读取该版本的快照,**不混用版本**;分析期间登记新版本不影响进行中的匹配。
 - 分析结果连同版本号一起落库,路网修订后旧分析仍可按原版本查询(`GET /api/analyses?network_version=...`)。
 
+## 里程对账(车载里程表 vs 匹配里程)
+
+结算巡检里程前,用**车载里程表读数**核对地图匹配算出的里程。匹配结果与读数解耦:
+读数补交/更正后**无需重跑地图匹配**,对账查询直接读取保存的结果。
+
+### 流程
+
+1. **匹配时保存核算依据**:新分析落库时按原轨迹采样序号逐点保存
+   `analysis_samples`(是否匹配、匹配到的累计里程、未匹配时的缺口原因),
+   以及带起止采样序号的 `gaps`。核算只依赖这份依据。
+2. **按轨迹编号整组补交/更正读数**:`POST/PUT /api/trajectories/{id}/odometer`
+   - 至少两条,用**不同的原轨迹采样序号**(`seq`,从 0 起)定位,累计米数(`odometer_m`)须非负;
+   - 整组替换该轨迹当前读数,补交与更正语义相同,`revision` 递增;
+   - 读数须落在该轨迹采样序号范围内(否则 422)。
+3. **对账**:`GET /api/analyses/{id}/reconciliation` 按分析编号查询保存的结果。
+   沿采样顺序**逐对核对相邻读数**,每段给出起止序号:
+   - `ok`:表计增量 `odometer_delta_m`、匹配里程 `matched_distance_m`、
+     差值 `difference_m = 匹配里程 - 表计增量`;
+   - `unverifiable`:区间内存在匹配缺口(`match_gap`,附具体缺口原因)或读数倒退
+     (`reading_regression`)时,注明无法核对的原因,不给出上述三个数值;
+   - 汇总只累计可核对段。
+
+### 状态与语义
+
+| status | 含义 |
+| --- | --- |
+| `pending_readings` | 新分析尚无读数,提示待补交 |
+| `ok` | 读数齐全,已按当前整组读数对账 |
+| `needs_rematch` | 旧分析缺少按采样序号保存的核算依据;原报告照常可查,对账提示重新匹配 |
+
+- **一致性**:新建分析、整组读数更新与受影响的对账结果在**同一事务**内生效;
+  保存失败会回滚,保留原读数与对账结果。
+- **交错安全**:匹配落库与读数更新都用 `BEGIN IMMEDIATE` 串行化,
+  对账在事务内按**当前整组读数**计算,因此交错执行时结果仍对应当前读数。
+- **旧数据兼容**:升级前生成的分析没有核算依据,`GET /api/analyses/{id}` 照常返回
+  (`basis_available=false`),对账返回 `needs_rematch`,重新匹配即可生成依据。
+
+示例:
+
+```bash
+# 按轨迹 1 整组补交读数:采样序号 0/2/4/6 对应累计里程
+curl -X POST localhost:8000/api/trajectories/1/odometer \
+  -H 'Content-Type: application/json' \
+  -d '{"readings": [
+        {"seq": 0, "odometer_m": 1000.0},
+        {"seq": 2, "odometer_m": 1085.0},
+        {"seq": 4, "odometer_m": 1196.0},
+        {"seq": 6, "odometer_m": 1281.0}]}'
+
+# 按分析编号查对账结果(直接读保存结果,不重跑匹配)
+curl localhost:8000/api/analyses/1/reconciliation
+```
+
+响应示例(节选):
+
+```json
+{
+  "analysis_id": 1,
+  "trajectory_id": 1,
+  "status": "ok",
+  "readings_revision": 1,
+  "segment_count": 3,
+  "checked_count": 3,
+  "unverifiable_count": 0,
+  "odometer_delta_m": 281.0,
+  "matched_distance_m": 281.0,
+  "difference_m": 0.0,
+  "segments": [
+    {"seq": 0, "start_seq": 0, "end_seq": 2, "status": "ok", "verifiable": true,
+     "reason": null, "reasons": [], "gap_reasons": [], "note": null,
+     "odometer_delta_m": 85.0, "matched_distance_m": 85.0, "difference_m": 0.0},
+    {"seq": 1, "start_seq": 2, "end_seq": 4, "status": "unverifiable", "verifiable": false,
+     "reason": "match_gap", "reasons": ["match_gap"], "gap_reasons": ["out_of_range"],
+     "note": "区间内存在匹配缺口,无法按地图匹配里程核对(out_of_range)",
+     "odometer_delta_m": null, "matched_distance_m": null, "difference_m": null}
+  ]
+}
+```
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -55,8 +134,11 @@ python3 -m venv .venv
 | POST | `/api/trajectories` | 提交轨迹(UTC 时刻 + 坐标,按时间排序存储) |
 | GET | `/api/trajectories/{id}` | 查看轨迹 |
 | POST | `/api/match` | 在指定版本上匹配,返回匹配路段、进入/离开时刻、里程、缺口 |
-| GET | `/api/analyses` | 查询历史分析(可按 `network_version`、`trajectory_id` 过滤) |
-| GET | `/api/analyses/{id}` | 查看分析结果 |
+| GET | `/api/analyses` | 查询历史分析(可按 `network_version`、`trajectory_id` 过滤;含 `reconciliation_status`) |
+| GET | `/api/analyses/{id}` | 查看分析结果(含按采样序号保存的核算依据 `samples`) |
+| GET | `/api/analyses/{id}/reconciliation` | 按分析编号查询保存的对账结果(别名 `/api/reconciliations/{id}`) |
+| POST/PUT | `/api/trajectories/{id}/odometer` | 按轨迹编号整组补交/更正读数(别名 `/api/odometer-readings/{id}`) |
+| GET | `/api/trajectories/{id}/odometer` | 查看轨迹当前整组读数 |
 | GET | `/health` | 健康检查 |
 
 ### 示例
@@ -113,13 +195,15 @@ curl -X POST localhost:8000/api/match -H 'Content-Type: application/json' \
 
 ```
 app/
-  main.py      FastAPI 路由与持久化
-  matcher.py   HMM + Viterbi 匹配引擎(候选、有向图最短路、缺口检测)
-  geo.py       球面距离、点到线段投影
-  db.py        SQLite 连接与建表
-  schemas.py   请求校验(Pydantic)
-  util.py      UTC 时间处理
-tests/test_api.py  端到端测试(连续路径、两类缺口、多候选全局最优、版本隔离)
+  main.py       FastAPI 路由与持久化
+  matcher.py    HMM + Viterbi 匹配引擎(候选、有向图最短路、缺口检测、按采样序号核算依据)
+  reconcile.py  里程对账计算与读写(核算依据、整组读数、对账结果)
+  geo.py        球面距离、点到线段投影
+  db.py         SQLite 连接与建表(含旧库自动补列)
+  schemas.py    请求校验(Pydantic,含读数整组校验)
+  util.py       UTC 时间处理
+tests/test_api.py       端到端测试(连续路径、两类缺口、多候选全局最优、版本隔离)
+tests/test_reconcile.py 对账测试(待补交、补交/更正、缺口与倒退、事务回滚、旧分析兼容)
 Dockerfile / docker-compose.yml
 ```
 

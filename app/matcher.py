@@ -243,6 +243,45 @@ class NetworkIndex:
                 merged.append([si, te, tl, dd])
         return [tuple(m) for m in merged]
 
+    def _sample_basis(self, points, pieces, cands, gaps) -> list[dict]:
+        """按采样序号生成核算依据。
+
+        - matched=True:该采样点已匹配,cumulative_matched_m 为从所在连续段起点
+          到该点的累计匹配里程(段起点为 0);
+        - matched=False:该点落在缺口内,gap_reason 记录具体原因。
+
+        相邻两个已匹配采样点的累计里程之差,即两段之间沿匹配路径的里程。
+        """
+        cumulative: dict[int, float] = {}
+        for idxs, path in pieces:
+            chosen = [cands[i][p] for i, p in zip(idxs, path)]
+            if not chosen:
+                continue
+            acc = 0.0
+            cumulative[idxs[0]] = 0.0
+            for k in range(len(chosen) - 1):
+                route = self.connector(chosen[k], chosen[k + 1])
+                if route is None:  # 防御性:Viterbi 已保证连通
+                    continue
+                acc += route[0]
+                cumulative[idxs[k + 1]] = acc
+
+        samples: list[dict] = []
+        for seq in range(len(points)):
+            if seq in cumulative:
+                samples.append({"seq": seq, "matched": True,
+                                "cumulative_matched_m": round(cumulative[seq], 3),
+                                "gap_reason": None})
+            else:
+                reason = GAP_OUT_OF_RANGE
+                for g in gaps:
+                    if g["start_seq"] <= seq <= g["end_seq"]:
+                        reason = g["reason"]
+                        break
+                samples.append({"seq": seq, "matched": False,
+                                "cumulative_matched_m": None, "gap_reason": reason})
+        return samples
+
     def match(self, points: list[TrackPoint]) -> dict:
         """对按时间升序的轨迹点列执行匹配,返回路径、缺口与统计。"""
         n = len(points)
@@ -270,27 +309,32 @@ class NetworkIndex:
                 visits.extend(v)
                 ranges.append((idxs[0], idxs[-1]))
 
-        # 3) 缺口
+        # 3) 缺口:start_seq/end_seq 为原始采样序号,用于按采样顺序核算
         gaps: list[dict] = []
         if not ranges:
-            gaps.append({"start_time": fmt_ts(points[0].ts), "end_time": fmt_ts(points[-1].ts),
+            gaps.append({"start_seq": 0, "end_seq": n - 1,
+                         "start_time": fmt_ts(points[0].ts), "end_time": fmt_ts(points[-1].ts),
                          "reason": GAP_OUT_OF_RANGE})
         else:
             if ranges[0][0] > 0:
-                gaps.append({"start_time": fmt_ts(points[0].ts),
+                gaps.append({"start_seq": 0, "end_seq": ranges[0][0],
+                             "start_time": fmt_ts(points[0].ts),
                              "end_time": fmt_ts(points[ranges[0][0]].ts),
                              "reason": GAP_OUT_OF_RANGE})
             for g in range(len(ranges) - 1):
                 p_end, q_start = ranges[g][1], ranges[g + 1][0]
                 reason = GAP_DISCONNECTED if q_start == p_end + 1 else GAP_OUT_OF_RANGE
-                gaps.append({"start_time": fmt_ts(points[p_end].ts),
+                gaps.append({"start_seq": p_end, "end_seq": q_start,
+                             "start_time": fmt_ts(points[p_end].ts),
                              "end_time": fmt_ts(points[q_start].ts),
                              "reason": reason})
             if ranges[-1][1] < n - 1:
-                gaps.append({"start_time": fmt_ts(points[ranges[-1][1]].ts),
+                gaps.append({"start_seq": ranges[-1][1], "end_seq": n - 1,
+                             "start_time": fmt_ts(points[ranges[-1][1]].ts),
                              "end_time": fmt_ts(points[-1].ts),
                              "reason": GAP_OUT_OF_RANGE})
 
+        # 4) 按采样序号核算依据:每点是否匹配 / 匹配到的累计里程 / 缺口原因
         path_json = [
             {"seq": k,
              "segment_id": self.segments[si].segment_id,
@@ -302,10 +346,13 @@ class NetworkIndex:
         for k, g in enumerate(gaps):
             g["seq"] = k
 
+        samples = self._sample_basis(points, pieces, cands, gaps)
+
         return {
             "total_points": n,
             "matched_points": sum(len(idxs) for idxs, _ in pieces),
             "total_distance_m": round(sum(v[3] for v in visits), 3),
             "path": path_json,
             "gaps": gaps,
+            "samples": samples,
         }

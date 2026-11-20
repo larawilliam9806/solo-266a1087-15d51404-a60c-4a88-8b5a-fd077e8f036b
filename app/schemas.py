@@ -49,3 +49,24 @@ class TrajectoryCreate(BaseModel):
 class MatchRequest(BaseModel):
     trajectory_id: int
     network_version: str = Field(min_length=1, description="指定匹配使用的路网版本;一次分析只使用该版本快照")
+
+
+class OdometerReadingIn(BaseModel):
+    seq: int = Field(ge=0, description="原轨迹采样序号")
+    odometer_m: float = Field(ge=0, description="车载里程表累计读数(米),须非负")
+
+
+class OdometerSubmit(BaseModel):
+    """整组补交/更正某条轨迹的里程表读数。
+
+    至少两条,用不同的采样序号定位;整组替换该轨迹当前读数。
+    """
+    readings: list[OdometerReadingIn] = Field(min_length=2)
+
+    @field_validator("readings")
+    @classmethod
+    def unique_seqs(cls, v: list[OdometerReadingIn]) -> list[OdometerReadingIn]:
+        seqs = [r.seq for r in v]
+        if len(seqs) != len(set(seqs)):
+            raise ValueError("同一组读数内采样序号 seq 不能重复")
+        return v
